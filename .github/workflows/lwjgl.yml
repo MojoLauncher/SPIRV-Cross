@@ -36,14 +36,13 @@ jobs:
         wget https://github.com/MojoLauncher/gcc-toolchain/releases/download/prebuilt/gcc-13-${{matrix.arch}}-21.tar.xz -O toolchain.tar.xz 2>/dev/null
         mkdir gcc
         tar xf toolchain.tar.xz -C gcc
-        export PATH="$(pwd)/gcc/bin:$PATH"
         mv gcc /opt/gcc-android
     - name: Build
       run: |
         mkdir build && cd build
         cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../gcc-${{matrix.arch}}.cmake $SPVC_PARAMS
         make -j$(nproc)
-        ${{matrix.triplet}}-strip libspirv-cross-c-shared.so
+        /opt/gcc-android/bin/${{matrix.triplet}}-strip libspirv-cross-c-shared.so
     - name: Upload
       uses: actions/upload-artifact@v7
       with:
