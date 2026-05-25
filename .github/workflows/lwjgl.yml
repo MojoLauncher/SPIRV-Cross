@@ -48,6 +48,44 @@ jobs:
       with:
         name: spvc-${{matrix.arch}}
         path: build/libspirv-cross-c-shared.so
+
+  aar:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Get packaging script
+      uses: actions/checkout@v6
+      with:
+        repository: 'whitebelyash/mesaunified-packager'
+    - name: Install zip
+      run: sudo apt -y install zip unzip
+    - name: Get spvc arm64
+      uses: actions/download-artifact@v4
+      with:
+        name: spvc-arm64
+        path: spvc/arm64
+    - name: Get spvc arm
+      uses: actions/download-artifact@v4
+      with:
+        name: spvc-arm
+        path: spvc/arm
+    - name: Get spv x86
+      uses: actions/download-artifact@v4
+      with:
+        name: spvc-x86
+        path: spvc/x86
+    - name: Get spvc x86_64
+      uses: actions/download-artifact@v4
+      with:
+        name: spvc-x86_64
+        path: spvc/x86_64
+    - name: Pack AAR
+      run: bash create_aar.sh $GITHUB_WORKSPACE/spvc spvc
+    - name: Upload packaging result
+      uses: actions/upload-artifact@v7
+      with:
+        name: spvc-aar
+        path: spvc.aar
         
         
       
