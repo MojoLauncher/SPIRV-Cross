@@ -12,6 +12,15 @@ jobs:
     strategy:
       matrix:
         arch: [ "arm64", "arm", "x86", "x86_64" ]
+        include:
+          - arch: arm64
+            triplet: aarch64-linux-android
+          - arch: arm
+            triplet: arm-linux-androideabi
+          - arch: x86
+            triplet: i686-linux-android
+          - arch: x86_64
+            triplet: x86_64-linux-android
       fail-fast: false
     runs-on: ubuntu-latest
     steps:
@@ -32,9 +41,9 @@ jobs:
     - name: Build
       run: |
         mkdir build && cd build
-        cmake .. -DCMAKE_TOOLCHAIN_FILE=../gcc-${{matrix.arch}}.cmake $SPVC_PARAMS
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=../gcc-${{matrix.arch}}.cmake $SPVC_PARAMS
         make -j$(nproc)
-        strip libspirv-cross-c-shared.so
+        ${{matrix.triplet}}-strip libspirv-cross-c-shared.so
     - name: Upload
       uses: actions/upload-artifact@v7
       with:
