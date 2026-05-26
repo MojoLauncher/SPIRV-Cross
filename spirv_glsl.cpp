@@ -32,9 +32,10 @@
 #include <utility>
 #include <array>
 
-#ifndef _WIN32
+/*#ifndef _WIN32
 #include <langinfo.h>
 #endif
+*/
 #include <locale.h>
 
 using namespace SPIRV_CROSS_SPV_HEADER_NAMESPACE;
