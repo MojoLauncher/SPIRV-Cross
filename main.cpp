@@ -677,6 +677,8 @@ struct CLIArguments
 	bool msl_manual_helper_invocation_updates = true;
 	bool msl_check_discarded_frag_stores = false;
 	bool msl_force_fragment_with_side_effects_execution = false;
+	bool msl_emulate_reversed_depth_viewport = false;
+	bool msl_emulate_depth_clip_enable = false;
 	bool msl_sample_dref_lod_array_as_grad = false;
 	bool msl_runtime_array_rich_descriptor = false;
 	bool msl_replace_recursive_inputs = false;
@@ -706,6 +708,7 @@ struct CLIArguments
 	SmallVector<uint32_t> msl_device_argument_buffers;
 	SmallVector<pair<uint32_t, uint32_t>> msl_dynamic_buffers;
 	SmallVector<pair<uint32_t, uint32_t>> msl_inline_uniform_blocks;
+	SmallVector<MSLResourceBinding> msl_resource_bindings;
 	SmallVector<MSLShaderInterfaceVariable> msl_shader_inputs;
 	SmallVector<MSLShaderInterfaceVariable> msl_shader_outputs;
 	SmallVector<PLSArg> pls_in;
@@ -911,6 +914,8 @@ static void print_help_msl()
 	                "\t[--msl-decoration-binding]:\n\t\tUse SPIR-V bindings directly as MSL bindings.\n"
 	                "\t\tThis does not work in the general case as there is no descriptor set support, and combined image samplers are split up.\n"
 	                "\t\tHowever, if the shader author knows of binding limitations, this option will avoid the need for reflection on Metal side.\n"
+	                "\t[--msl-resource-binding <set index> <binding> <buffer index> <texture index> <sampler index>]:\n\t\tMaps a descriptor binding of the entry point to explicit MSL buffer, texture and sampler indices.\n"
+	                "\t\tWith argument buffers, these are the [[id(N)]] indices in the argument buffer.\n"
 	                "\t[--msl-force-active-argument-buffer-resources]:\n\t\tAlways emit resources which are part of argument buffers.\n"
 	                "\t\tThis makes sure that similar shaders with same resource declarations can share the argument buffer as declaring an argument buffer implies an ABI.\n"
 	                "\t[--msl-force-native-arrays]:\n\t\tRather than implementing array types as a templated value type ala std::array<T>, use plain, native arrays.\n"
@@ -981,6 +986,8 @@ static void print_help_msl()
 	                "\t\t\t4. Fragment is always discarded in fragment execution.\n"
 	                "\t\tHowever, Vulkan expects fragment shader to be executed since it cannot be discarded until the discard\n"
 	                "\t\tpresent in the fragment execution, which would also execute the operations with side effects.\n"
+	                "\t[--msl-emulate-reversed-depth-viewport]:\n\t\tEmulate reversed-depth viewports by inverting clip-space Z.\n"
+	                "\t[--msl-emulate-depth-clip-enable]:\n\t\tEmulate Vulkan depth clip and clamp combinations unsupported by Metal.\n"
 	                "\t[--msl-sample-dref-lod-array-as-grad]:\n\t\tUse a gradient instead of a level argument.\n"
 	                "\t\tSome Metal devices have a bug where the level() argument to\n"
 	                "\t\tdepth2d_array<T>::sample_compare() in a fragment shader is biased by some\n"
@@ -1298,6 +1305,8 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.manual_helper_invocation_updates = args.msl_manual_helper_invocation_updates;
 		msl_opts.check_discarded_frag_stores = args.msl_check_discarded_frag_stores;
 		msl_opts.force_fragment_with_side_effects_execution = args.msl_force_fragment_with_side_effects_execution;
+		msl_opts.emulate_reversed_depth_viewport = args.msl_emulate_reversed_depth_viewport;
+		msl_opts.emulate_depth_clip_enable = args.msl_emulate_depth_clip_enable;
 		msl_opts.sample_dref_lod_array_as_grad = args.msl_sample_dref_lod_array_as_grad;
 		msl_opts.ios_support_base_vertex_instance = true;
 		msl_opts.runtime_array_rich_descriptor = args.msl_runtime_array_rich_descriptor;
@@ -1429,6 +1438,17 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 
 	if (!entry_point.empty())
 		compiler->set_entry_point(entry_point, model);
+
+	if (args.msl)
+	{
+		// Resource bindings are per stage, so add them once the entry point is known.
+		auto *msl_comp = static_cast<CompilerMSL *>(compiler.get());
+		for (auto binding : args.msl_resource_bindings)
+		{
+			binding.stage = compiler->get_execution_model();
+			msl_comp->add_msl_resource_binding(binding);
+		}
+	}
 
 	if (!args.set_version && !compiler->get_common_options().version)
 	{
@@ -1787,6 +1807,18 @@ static int main_inner(int argc, char *argv[])
 		uint32_t binding = parser.next_uint();
 		args.msl_inline_uniform_blocks.push_back(make_pair(desc_set, binding));
 	});
+	cbs.add("--msl-resource-binding",
+	        [&args](CLIParser &parser)
+	        {
+		        // Make sure next_uint() is called in-order.
+		        MSLResourceBinding binding;
+		        binding.desc_set = parser.next_uint();
+		        binding.binding = parser.next_uint();
+		        binding.msl_buffer = parser.next_uint();
+		        binding.msl_texture = parser.next_uint();
+		        binding.msl_sampler = parser.next_uint();
+		        args.msl_resource_bindings.push_back(binding);
+	        });
 	cbs.add("--msl-force-native-arrays", [&args](CLIParser &) { args.msl_force_native_arrays = true; });
 	cbs.add("--msl-disable-frag-depth-builtin", [&args](CLIParser &) { args.msl_enable_frag_depth_builtin = false; });
 	cbs.add("--msl-disable-frag-stencil-ref-builtin",
@@ -1901,6 +1933,8 @@ static int main_inner(int argc, char *argv[])
 	        [&args](CLIParser &) { args.msl_manual_helper_invocation_updates = false; });
 	cbs.add("--msl-check-discarded-frag-stores", [&args](CLIParser &) { args.msl_check_discarded_frag_stores = true; });
 	cbs.add("--msl-force-frag-with-side-effects-execution", [&args](CLIParser &) { args.msl_force_fragment_with_side_effects_execution = true; });
+	cbs.add("--msl-emulate-reversed-depth-viewport", [&args](CLIParser &) { args.msl_emulate_reversed_depth_viewport = true; });
+	cbs.add("--msl-emulate-depth-clip-enable", [&args](CLIParser &) { args.msl_emulate_depth_clip_enable = true; });
 	cbs.add("--msl-sample-dref-lod-array-as-grad",
 	        [&args](CLIParser &) { args.msl_sample_dref_lod_array_as_grad = true; });
 	cbs.add("--msl-no-readwrite-texture-fences", [&args](CLIParser &) { args.msl_readwrite_texture_fences = false; });

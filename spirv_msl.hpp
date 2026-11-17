@@ -286,7 +286,8 @@ static const uint32_t kBufferSizeBufferBinding = ~(2u);
 // will start at max(kArgumentBufferBinding) + 1.
 static const uint32_t kArgumentBufferBinding = ~(3u);
 
-static const uint32_t kMaxArgumentBuffers = 8;
+// Somewhat arbitrary. Can't be too large or it starts eating into builtin magic buffers, etc.
+static const uint32_t kMaxArgumentBuffers = 16;
 
 // Decompiles SPIR-V to Metal Shading Language
 class CompilerMSL : public CompilerGLSL
@@ -318,6 +319,8 @@ public:
 		uint32_t shader_index_buffer_index = 21;
 		uint32_t shader_patch_input_buffer_index = 20;
         uint32_t draw_id_buffer_index = 19;
+		uint32_t reversed_depth_viewport_buffer_index = 18;
+		uint32_t depth_clip_state_buffer_index = 17;
 		uint32_t shader_input_wg_index = 0;
 		uint32_t device_index = 0;
 		uint32_t enable_frag_output_mask = 0xffffffff;
@@ -339,6 +342,8 @@ public:
 		bool view_index_from_device_index = false;
 		bool dispatch_base = false;
 		bool texture_1D_as_2D = false;
+		bool emulate_reversed_depth_viewport = false;
+		bool emulate_depth_clip_enable = false;
 
 		// Enable use of Metal argument buffers.
 		// MSL 2.0 must also be enabled.
@@ -612,6 +617,14 @@ public:
 		return !buffers_requiring_array_length.empty();
 	}
 
+	// Provide feedback to calling API to determine if the vertex shader writes
+	// to PointSize. This allows the API to avoid declaring a point size output
+	// when it is not needed.
+	bool get_writes_to_point_size() const
+	{
+		return writes_to_point_size;
+	}
+
 	bool buffer_requires_array_length(VariableID id) const
 	{
 		return buffers_requiring_array_length.count(id) != 0;
@@ -622,6 +635,17 @@ public:
 	bool needs_view_mask_buffer() const
 	{
 		return msl_options.multiview && !msl_options.view_index_from_device_index;
+	}
+
+	// Provide feedback to calling API to allow it to pass depth clip
+	// emulation state.
+	bool needs_depth_clip_state_buffer() const
+	{
+		if (!msl_options.emulate_depth_clip_enable || !stage_out_var_id || capture_output_to_buffer)
+			return false;
+
+		return (is_vertex_like_shader() && !qual_pos_var_name.empty()) ||
+		       (get_execution_model() == ExecutionModelFragment && !qual_frag_depth_var_name.empty());
 	}
 
 	// Provide feedback to calling API to allow it to pass a buffer
@@ -891,6 +915,7 @@ protected:
 		SPVFuncImplReduceAdd,
 		SPVFuncImplImageFence,
 		SPVFuncImplTextureCast,
+		SPVFuncImplDepthCast,
 		SPVFuncImplMulExtended,
 		SPVFuncImplSetMeshOutputsEXT,
 		SPVFuncImplAssume,
@@ -975,13 +1000,16 @@ protected:
 
 	bool is_patch_block(const SPIRType &type);
 	bool is_non_native_row_major_matrix(uint32_t id) override;
-	bool member_is_non_native_row_major_matrix(const SPIRType &type, uint32_t index) override;
+	bool member_is_non_native_row_major_matrix(const SPIRType &type, uint32_t index, bool is_layout_disabled = false) override;
 	std::string convert_row_major_matrix(std::string exp_str, const SPIRType &exp_type, uint32_t physical_type_id,
 	                                     bool is_packed, bool relaxed) override;
 
 	bool is_tesc_shader() const;
 	bool is_tese_shader() const;
 	bool is_mesh_shader() const;
+	bool is_mesh_output_with_default(BuiltIn builtin, StorageClass storage) const;
+	bool is_64bit_integer_interface(const SPIRType &type) const;
+	std::string interface_word_swizzle(const SPIRType &type, uint32_t index);
 
 	void preprocess_op_codes();
 	void localize_global_variables();
@@ -1054,6 +1082,7 @@ protected:
 
 	void emit_custom_templates();
 	void emit_custom_functions();
+	void emit_precise_helper_begin(const char *signature);
 	void emit_resources();
 	void emit_specialization_constants_and_structs();
 	void emit_interface_block(uint32_t ib_var_id);
@@ -1152,6 +1181,18 @@ protected:
 	bool emit_array_copy(const char *expr, uint32_t lhs_id, uint32_t rhs_id,
 	                     StorageClass lhs_storage, StorageClass rhs_storage) override;
 	void build_implicit_builtins();
+
+	// Emulates element-wise operations on simdgroup matrices, which Metal does not support natively.
+	std::string to_cooperative_matrix_component(uint32_t id, const std::string &index);
+	void emit_cooperative_matrix_unary_op(uint32_t result_type, uint32_t result_id, uint32_t op0, const char *op);
+	void emit_cooperative_matrix_binary_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1,
+	                                       const char *op);
+	void emit_cooperative_matrix_unary_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0, const char *op);
+	void emit_cooperative_matrix_select_op(uint32_t result_type, uint32_t result_id, uint32_t cond, uint32_t op0,
+	                                       uint32_t op1);
+	bool maybe_emit_cooperative_matrix_op(const Instruction &instruction);
+	void validate_cooperative_matrix_type(const SPIRType &type);
+	void validate_cooperative_matrix_types();
 	uint32_t build_constant_uint_array_pointer();
 	void emit_entry_point_declarations() override;
 	bool uses_explicit_early_fragment_test();
@@ -1288,6 +1329,9 @@ protected:
 	bool writes_to_depth = false;
 	bool writes_to_point_size = false;
 	std::string qual_pos_var_name;
+	std::string qual_viewport_idx_var_name;
+	std::string qual_frag_depth_var_name;
+	std::string depth_clip_viewport_idx_var_name;
 	std::string stage_in_var_name = "in";
 	std::string stage_out_var_name = "out";
 	std::string patch_stage_in_var_name = "patchIn";
@@ -1337,6 +1381,7 @@ protected:
 
 	void emit_argument_buffer_aliased_descriptor(const SPIRVariable &aliased_var,
 	                                             const SPIRVariable &base_var);
+	void emit_argument_buffer_aliased_sampler(const SPIRVariable &aliased_var, const SPIRVariable &base_var);
 
 	void analyze_argument_buffers();
 	bool descriptor_set_is_argument_buffer(uint32_t desc_set) const;

@@ -378,6 +378,7 @@ enum Types
 	TypeUndef,
 	TypeString,
 	TypeDebugLocalVariable,
+	TypeConstantData,
 	TypeCount
 };
 
@@ -876,7 +877,8 @@ struct SPIRBlock : IVariant
 		Kill, // Discard
 		IgnoreIntersection, // Ray Tracing
 		TerminateRay, // Ray Tracing
-		EmitMeshTasks // Mesh shaders
+		EmitMeshTasks, // Mesh shaders
+		ShaderAbort
 	};
 
 	enum Merge
@@ -944,6 +946,12 @@ struct SPIRBlock : IVariant
 		ID groups[3];
 		ID payload;
 	} mesh = {};
+
+	struct
+	{
+		TypeID physical_type;
+		ID payload;
+	} shader_abort = {};
 
 	SmallVector<Instruction> ops;
 
@@ -1016,8 +1024,9 @@ struct SPIRFunction : IVariant
 		type = TypeFunction
 	};
 
-	SPIRFunction(TypeID return_type_, TypeID function_type_)
+	SPIRFunction(TypeID return_type_, uint32_t function_control_, TypeID function_type_)
 	    : return_type(return_type_)
+		, function_control(function_control_)
 	    , function_type(function_type_)
 	{
 	}
@@ -1056,6 +1065,7 @@ struct SPIRFunction : IVariant
 	};
 
 	TypeID return_type;
+	uint32_t function_control;
 	TypeID function_type;
 	SmallVector<Parameter> arguments;
 
@@ -1224,6 +1234,23 @@ struct SPIRVariable : IVariant
 	SPIRV_CROSS_DECLARE_CLONE(SPIRVariable)
 };
 
+struct SPIRConstantData : IVariant
+{
+	enum
+	{
+		type = TypeConstantData
+	};
+
+	SPIRConstantData(TypeID type_id_, const uint32_t *words_, uint32_t word_count, bool specialization_)
+		: type_id(type_id_), words(words_, words_ + word_count), specialization(specialization_) {}
+
+	TypeID type_id;
+	SmallVector<uint32_t> words;
+	bool specialization;
+
+	SPIRV_CROSS_DECLARE_CLONE(SPIRConstantData)
+};
+
 struct SPIRConstant : IVariant
 {
 	enum
@@ -1331,42 +1358,56 @@ struct SPIRConstant : IVariant
 		else
 		{
 			// Reuse the FP16 to FP32 code. Cute bit-hackery.
-			return f16_to_f32((int16_t(int8_t(v)) << 7) & (0xffff ^ 0x4000)) * 256.0f;
+			return f16_to_f32((uint16_t(int8_t(v)) << 7) & (0xffff ^ 0x4000)) * 256.0f;
 		}
 	}
 
 	inline uint32_t specialization_constant_id(uint32_t col, uint32_t row) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].id[row];
 	}
 
 	inline uint32_t specialization_constant_id(uint32_t col) const
 	{
+		if (col >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.id[col];
 	}
 
 	inline uint32_t scalar(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].u32;
 	}
 
 	inline int16_t scalar_i16(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return int16_t(m.c[col].r[row].u32 & 0xffffu);
 	}
 
 	inline uint16_t scalar_u16(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return uint16_t(m.c[col].r[row].u32 & 0xffffu);
 	}
 
 	inline int8_t scalar_i8(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return int8_t(m.c[col].r[row].u32 & 0xffu);
 	}
 
 	inline uint8_t scalar_u8(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return uint8_t(m.c[col].r[row].u32 & 0xffu);
 	}
 
@@ -1395,26 +1436,36 @@ struct SPIRConstant : IVariant
 
 	inline float scalar_f32(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].f32;
 	}
 
 	inline int32_t scalar_i32(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].i32;
 	}
 
 	inline double scalar_f64(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].f64;
 	}
 
 	inline int64_t scalar_i64(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].i64;
 	}
 
 	inline uint64_t scalar_u64(uint32_t col = 0, uint32_t row = 0) const
 	{
+		if (col >= 4 || row >= 4)
+			SPIRV_CROSS_THROW("Out of bounds col/row. Long vector bug.");
 		return m.c[col].r[row].u64;
 	}
 
@@ -1447,6 +1498,9 @@ struct SPIRConstant : IVariant
 			return false;
 		if (!subconstants.empty())
 			return false;
+
+		// Only used in contexts where we consume normal vectors.
+		// Don't need to consider long vector or composites.
 
 		for (uint32_t col = 0; col < columns(); col++)
 			for (uint32_t row = 0; row < vector_size(); row++)
@@ -1500,7 +1554,16 @@ struct SPIRConstant : IVariant
 	    : constant_type(constant_type_)
 	    , specialization(specialized)
 	{
+		// A composite constant must have at least one constituent. With zero
+		// constituents vector_elements[0] is read from an uninitialized pointer,
+		// which is an out-of-bounds read on malformed input.
+		if (num_elements == 0)
+			SPIRV_CROSS_THROW("Composite constant must have at least one constituent.");
+
 		bool matrix = vector_elements[0]->m.c[0].vecsize > 1;
+
+		if (num_elements > 4)
+			SPIRV_CROSS_THROW("Invalid constant. Long vector bug.");
 
 		if (matrix)
 		{
@@ -1543,6 +1606,7 @@ struct SPIRConstant : IVariant
 	bool is_null_array_specialized_length = false;
 
 	// For composites which are constant arrays, etc.
+	// Also used by long vectors where N > 4 or N is unknown.
 	SmallVector<ConstantID> subconstants;
 
 	// Whether the subconstants are intended to be replicated (e.g. OpConstantCompositeReplicateEXT)
@@ -2076,6 +2140,8 @@ static const uint32_t ResourceBindingPushConstantDescriptorSet = ~(0u);
 // Special constant used in a {MSL,HLSL}ResourceBinding binding
 // element to indicate the bindings for the push constants.
 static const uint32_t ResourceBindingPushConstantBinding = 0;
+
+std::string extract_string(const uint32_t *spirv, size_t size);
 } // namespace SPIRV_CROSS_NAMESPACE
 
 namespace std

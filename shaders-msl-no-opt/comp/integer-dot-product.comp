@@ -79,6 +79,9 @@ uint sdotaddsat_uint_result(u16vec4 x, u16vec4 y, uint acc);
 spirv_instruction (extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6019, 6016], id = 4454)
 uint udotaddsat(u16vec4 x, u16vec4 y, uint acc);
 
+spirv_instruction (extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6019, 6018], id = 4454)
+uint udotaddsat_packed(uint x, uint y, uint acc, spirv_literal uint packedFormat);
+
 // SUDotAccSat
 spirv_instruction (extensions = ["SPV_KHR_integer_dot_product"], capabilities = [6019, 6016], id = 4455)
 int sudotaddsat_int_result(u16vec4 x, u16vec4 y, int acc);
@@ -111,4 +114,6 @@ void main() {
     uint udotaddsat_uint = udotaddsat(comp3.x, comp3.y, comp3.acc);
     int sudotaddsat_int = sudotaddsat_int_result(comp3.x, comp3.y, comp3.acc);
     uint sudotaddsat_uint = sudotaddsat_uint_result(comp3.x, comp3.y, comp3.acc);
+
+    uint udotaddsat_pack = udotaddsat_packed(comp2.x, comp2.y, comp3.acc, 0); // PackedVectorFormat4x8Bit
 }

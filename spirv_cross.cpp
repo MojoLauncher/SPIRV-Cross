@@ -88,14 +88,19 @@ bool Compiler::variable_storage_is_aliased(const SPIRVariable &v)
 	bool image = type.basetype == SPIRType::Image;
 	bool counter = type.basetype == SPIRType::AtomicCounter;
 	bool buffer_reference = type.storage == StorageClassPhysicalStorageBuffer;
+	bool shared_block =
+	    type.storage == StorageClassWorkgroup && has_decoration(type.self, Decoration::DecorationBlock);
 
 	bool is_restrict;
 	if (ssbo)
 		is_restrict = ir.get_buffer_block_flags(v).get(DecorationRestrict);
+	else if (shared_block)
+		// When more than one shared block is present, all shared blocks must be decorated Aliased
+		is_restrict = !has_decoration(v.self, DecorationAliased);
 	else
 		is_restrict = has_decoration(v.self, DecorationRestrict);
 
-	return !is_restrict && (ssbo || image || counter || buffer_reference);
+	return !is_restrict && (ssbo || image || counter || buffer_reference || shared_block);
 }
 
 bool Compiler::block_is_control_dependent(const SPIRBlock &block)
@@ -196,7 +201,8 @@ bool Compiler::block_is_pure(const SPIRBlock &block)
 	if (block.terminator == SPIRBlock::Kill ||
 	    block.terminator == SPIRBlock::TerminateRay ||
 	    block.terminator == SPIRBlock::IgnoreIntersection ||
-	    block.terminator == SPIRBlock::EmitMeshTasks)
+	    block.terminator == SPIRBlock::EmitMeshTasks ||
+	    block.terminator == SPIRBlock::ShaderAbort)
 		return false;
 
 	for (auto &i : block.ops)
@@ -497,6 +503,10 @@ void Compiler::register_write(uint32_t chain)
 		// If our variable is in a storage class which can alias with other buffers,
 		// invalidate all variables which depend on aliased variables. And if this is a
 		// variable pointer, then invalidate all variables regardless.
+		// For BDA, this is overly conservative, since BDA pointers are usually restrict
+		// depending on how that BDA pointer is loaded, but being overly conservative
+		// is better than risking bad aliasing which is very hard to diagnose.
+		// The only real cost is slightly less pretty code, which is an acceptable compromise.
 		if (get_variable_data_type(*var).pointer)
 		{
 			flush_all_active_variables();
@@ -629,6 +639,9 @@ uint32_t Compiler::expression_type_id(uint32_t id) const
 
 	case TypeAccessChain:
 		return get<SPIRAccessChain>(id).basetype;
+
+	case TypeConstantData:
+		return get<SPIRConstantData>(id).type_id;
 
 	default:
 		SPIRV_CROSS_THROW("Cannot resolve expression type.");
@@ -810,6 +823,16 @@ bool Compiler::is_physical_pointer_to_buffer_block(const SPIRType &type) const
 bool Compiler::is_runtime_size_array(const SPIRType &type)
 {
 	return type.op == OpTypeRuntimeArray;
+}
+
+bool Compiler::is_struct_wrapped_opaque_descriptor_array(const SPIRType &type) const
+{
+	// Specific detection of glslang code patterns.
+	return type.basetype == SPIRType::Struct &&
+	       has_decoration(type.self, DecorationBlock) &&
+	       type.member_types.size() == 1 &&
+	       type_is_opaque_value(get<SPIRType>(type.member_types.front())) &&
+	       is_runtime_size_array(get<SPIRType>(type.member_types.front()));
 }
 
 ShaderResources Compiler::get_shader_resources() const
@@ -1285,9 +1308,11 @@ void Compiler::parse_fixup()
 		else if (id.get_type() == TypeVariable)
 		{
 			auto &var = id.get<SPIRVariable>();
-			if (var.storage == StorageClassPrivate || var.storage == StorageClassWorkgroup ||
-			    var.storage == StorageClassTaskPayloadWorkgroupEXT ||
-			    var.storage == StorageClassOutput)
+			auto &type = get<SPIRType>(var.basetype);
+
+			if (var.storage == StorageClassPrivate ||
+			    (var.storage == StorageClassWorkgroup && !has_decoration(type.self, DecorationBlock)) ||
+			    var.storage == StorageClassTaskPayloadWorkgroupEXT || var.storage == StorageClassOutput)
 			{
 				global_variables.push_back(var.self);
 			}
@@ -5499,7 +5524,7 @@ void Compiler::analyze_descriptor_heap_types()
 				if (ptr_type.basetype == SPIRType::Struct)
 				{
 					DescriptorHeapMeta meta = {};
-					meta.type = ptr_type.self;
+					meta.data_type = ptr_type.self;
 					meta.hlsl_style_stride = hlsl_style_stride_access_chains.count(args[2]);
 					meta.buffer_pointer_id = args[1];
 					meta.storage = ptr_type.storage;
@@ -5520,6 +5545,25 @@ void Compiler::analyze_descriptor_heap_types()
 			{
 				auto &data_type = compiler.get<SPIRType>(args[2]);
 
+				// Newer glslang can emit uniformconstant descriptors as:
+				// struct { non{readable,writable} T descriptors[]; }, as a way to add NonWritable / NonReadable.
+				// Detect this as a special case. We cannot deal with arbitrary complication in HLLs.
+				bool is_struct_wrapped_runtime_array = compiler.is_struct_wrapped_opaque_descriptor_array(data_type);
+
+				TypeID descriptor_array_type_id = args[2];
+				if (is_struct_wrapped_runtime_array)
+				{
+					descriptor_array_type_id = data_type.member_types.front();
+					if (!compiler.has_member_decoration(data_type.self, 0, DecorationOffset) &&
+					    compiler.get_member_decoration(data_type.self, 0, DecorationOffset) != 0)
+					{
+						ID offset_id = compiler.get_member_decoration(data_type.self, 0, DecorationOffsetIdEXT);
+						auto *c = compiler.maybe_get <SPIRConstant>(offset_id);
+						if (!c || c->specialization || c->scalar() != 0)
+							SPIRV_CROSS_THROW("Offset for resource heap must be constant 0.");
+					}
+				}
+
 				if (compiler.is_pointer(data_type))
 					SPIRV_CROSS_THROW("pointer type not allowed.");
 
@@ -5528,11 +5572,11 @@ void Compiler::analyze_descriptor_heap_types()
 				// Need to validate the array stride and types. HLLs are not flexible enough to support the full flexibility of SPIR-V.
 				if (BuiltIn(compiler.get_decoration(args[3], DecorationBuiltIn)) == BuiltInResourceHeapEXT)
 				{
-					if (!compiler.is_runtime_size_array(data_type))
+					if (!is_struct_wrapped_runtime_array && !is_runtime_size_array(data_type))
 						SPIRV_CROSS_THROW("Descriptor heap must be accessed as a runtime array.");
 
 					// The only meaningful use of this is ArrayStride equal to sizeof(type) right now.
-					uint32_t array_stride_id = compiler.get_decoration(args[2], DecorationArrayStrideIdEXT);
+					uint32_t array_stride_id = compiler.get_decoration(descriptor_array_type_id, DecorationArrayStrideIdEXT);
 					if (!array_stride_id)
 						SPIRV_CROSS_THROW("Expected ArrayStrideIdEXT to be set for resource heap.");
 
@@ -5563,19 +5607,20 @@ void Compiler::analyze_descriptor_heap_types()
 					if (c && !c->size_of_type)
 						SPIRV_CROSS_THROW("Resource heap array stride must be ConstantSizeOfEXT for high level languages.");
 
-					auto &element_type = compiler.get<SPIRType>(data_type.parent_type);
+					auto &descriptor_array_type = compiler.get<SPIRType>(descriptor_array_type_id);
+					auto &element_type = compiler.get<SPIRType>(descriptor_array_type.parent_type);
 
 					if (element_type.basetype == SPIRType::DescriptorHeapBuffer)
 					{
 						if (c && compiler.get<SPIRType>(c->size_of_type).basetype != SPIRType::DescriptorHeapBuffer)
 							SPIRV_CROSS_THROW("Buffer descriptors in heap must be ConstantSizeOfEXT(OpTypeBufferEXT) for GLSL.");
 					}
-					else if (data_type.basetype == SPIRType::Image)
+					else if (element_type.basetype == SPIRType::Image)
 					{
 						if (c && compiler.get<SPIRType>(c->size_of_type).basetype != SPIRType::Image)
 							SPIRV_CROSS_THROW("Image descriptors in heap must be ConstantSizeOfEXT(OpTypeImage) for GLSL.");
 					}
-					else if (data_type.basetype == SPIRType::AccelerationStructure)
+					else if (element_type.basetype == SPIRType::AccelerationStructure)
 					{
 						if (c && compiler.get<SPIRType>(c->size_of_type).basetype != SPIRType::AccelerationStructure)
 							SPIRV_CROSS_THROW("RTAS descriptors in heap must be ConstantSizeOfEXT(OpTypeAccelerationStructure) for GLSL.");
@@ -5583,11 +5628,11 @@ void Compiler::analyze_descriptor_heap_types()
 				}
 				else if (BuiltIn(compiler.get_decoration(args[3], DecorationBuiltIn)) == BuiltInSamplerHeapEXT)
 				{
-					if (!compiler.is_runtime_size_array(data_type))
+					if (!is_struct_wrapped_runtime_array && !is_runtime_size_array(data_type))
 						SPIRV_CROSS_THROW("Descriptor heap must be accessed as a runtime array.");
 
 					// The only meaningful use of this is ArrayStride equal to sizeof(sampler) right now.
-					uint32_t array_stride_id = compiler.get_decoration(args[2], DecorationArrayStrideIdEXT);
+					uint32_t array_stride_id = compiler.get_decoration(descriptor_array_type_id, DecorationArrayStrideIdEXT);
 					if (!array_stride_id)
 						SPIRV_CROSS_THROW("Expected ArrayStrideIdEXT to be set for sampler heap.");
 
@@ -5600,23 +5645,38 @@ void Compiler::analyze_descriptor_heap_types()
 				if (hlsl_style_stride)
 					hlsl_style_stride_access_chains.insert(args[1]);
 
-				if (data_type.basetype == SPIRType::SampledImage)
+				auto *element_type = &compiler.get<SPIRType>(descriptor_array_type_id);
+				while (compiler.is_array(*element_type))
+					element_type = &compiler.get<SPIRType>(element_type->parent_type);
+
+				if (element_type->basetype == SPIRType::SampledImage)
 				{
 					SPIRV_CROSS_THROW("Attempting to access heap as combined sampler image. This does not make sense.");
 				}
-				else if (data_type.basetype == SPIRType::Image ||
-				         data_type.basetype == SPIRType::AccelerationStructure ||
-				         data_type.basetype == SPIRType::Sampler)
+				else if (element_type->basetype == SPIRType::Image ||
+				         element_type->basetype == SPIRType::AccelerationStructure ||
+				         element_type->basetype == SPIRType::Sampler)
 				{
 					DescriptorHeapMeta meta = {};
-					meta.type = data_type.self;
+					meta.data_type = element_type->self;
+					meta.name_type = data_type.self;
 					meta.hlsl_style_stride = hlsl_style_stride;
+
+					if (is_struct_wrapped_runtime_array)
+					{
+						meta.nonreadable = compiler.has_member_decoration(data_type.self, 0, DecorationNonReadable);
+						meta.nonwritable = compiler.has_member_decoration(data_type.self, 0, DecorationNonWritable);
+						meta.coherent = compiler.has_member_decoration(data_type.self, 0, DecorationCoherent);
+						meta.is_volatile = compiler.has_member_decoration(data_type.self, 0, DecorationVolatile);
+						meta.is_restrict = compiler.has_member_decoration(data_type.self, 0, DecorationRestrict);
+					}
+
 					add_unique_type(meta);
 				}
 				else if (buffer_pointers.count(args[3]) != 0)
 				{
-					if (!compiler.has_decoration(data_type.self, DecorationBlock) &&
-					    !compiler.has_decoration(data_type.self, DecorationBufferBlock))
+					if (!compiler.has_decoration(element_type->self, DecorationBlock) &&
+					    !compiler.has_decoration(element_type->self, DecorationBufferBlock))
 					{
 						SPIRV_CROSS_THROW("BufferPointerEXT must reference a block type.");
 					}
@@ -5627,7 +5687,7 @@ void Compiler::analyze_descriptor_heap_types()
 					{
 						// This is where the pointer becomes typed, so register it here.
 						DescriptorHeapMeta meta = {};
-						meta.type = data_type.self;
+						meta.data_type = data_type.self;
 						meta.hlsl_style_stride = pointer_meta.hlsl_style_stride;
 						meta.buffer_pointer_id = args[3];
 						meta.storage = buffer_type.storage;
@@ -5663,11 +5723,12 @@ void Compiler::analyze_descriptor_heap_types()
 
 		void add_unique_type(const DescriptorHeapMeta &meta)
 		{
-			assert(meta.type != 0);
+			assert(meta.data_type != 0);
 
 			for (auto &type : heap_types)
 			{
-				if (type.type == meta.type && type.storage == meta.storage &&
+				if (type.data_type == meta.data_type && type.name_type == meta.name_type &&
+				    type.storage == meta.storage &&
 				    type.buffer_pointer_id == meta.buffer_pointer_id &&
 				    type.nonreadable == meta.nonreadable &&
 				    type.nonwritable == meta.nonwritable &&
@@ -6001,6 +6062,25 @@ void Compiler::analyze_interlocked_resource_usage()
 		interlocked_is_complex =
 		    !handler.use_critical_section || handler.interlock_function_id != ir.default_entry_point;
 	}
+}
+
+void Compiler::analyze_shader_abort_usage()
+{
+	ir.for_each_typed_id<SPIRFunction>([&](uint32_t, const SPIRFunction &func)
+	{
+		for (auto &block_id : func.blocks)
+		{
+			auto &block = this->get<SPIRBlock>(block_id);
+			if (block.terminator == SPIRBlock::ShaderAbort)
+			{
+				// Don't declare this explicitly.
+				abort_block_types.insert(block.shader_abort.physical_type);
+				// Mark the composite as being consumed by abort.
+				// It should not be emitted as-is.
+				abort_payloads[block.shader_abort.payload] = {};
+			}
+		}
+	});
 }
 
 // Helper function

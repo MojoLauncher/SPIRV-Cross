@@ -22,6 +22,7 @@
  */
 
 #include "spirv_parser.hpp"
+#include "spirv_common.hpp"
 #include "NonSemanticShaderDebugInfo100.h"
 #include <assert.h>
 
@@ -189,23 +190,9 @@ const uint32_t *Parser::stream(const Instruction &instr) const
 	return &ir.spirv[instr.offset];
 }
 
-static string extract_string(const vector<uint32_t> &spirv, uint32_t offset)
+static string extract_string(const std::vector<uint32_t> &spirv, uint32_t offset)
 {
-	string ret;
-	for (uint32_t i = offset; i < spirv.size(); i++)
-	{
-		uint32_t w = spirv[i];
-
-		for (uint32_t j = 0; j < 4; j++, w >>= 8)
-		{
-			char c = w & 0xff;
-			if (c == '\0')
-				return ret;
-			ret += c;
-		}
-	}
-
-	SPIRV_CROSS_THROW("String was not terminated before EOF");
+	return extract_string(spirv.data() + offset, spirv.size() - offset);
 }
 
 void Parser::parse(const Instruction &instruction)
@@ -338,7 +325,7 @@ void Parser::parse(const Instruction &instruction)
 			spirv_ext = SPIRExtension::SPV_AMD_gcn_shader;
 		else if (ext == "NonSemantic.DebugPrintf")
 			spirv_ext = SPIRExtension::NonSemanticDebugPrintf;
-		else if (ext == "NonSemantic.Shader.DebugInfo.100")
+		else if (ext.find("NonSemantic.Shader.DebugInfo.") == 0)
 			spirv_ext = SPIRExtension::NonSemanticShaderDebugInfo;
 		else if (ext.find("NonSemantic.") == 0)
 			spirv_ext = SPIRExtension::NonSemanticGeneric;
@@ -650,6 +637,7 @@ void Parser::parse(const Instruction &instruction)
 	}
 
 	case OpMemberDecorate:
+	case OpMemberDecorateIdEXT:
 	{
 		uint32_t id = ops[0];
 		uint32_t member = ops[1];
@@ -660,12 +648,6 @@ void Parser::parse(const Instruction &instruction)
 			ir.set_member_decoration(id, member, decoration);
 		break;
 	}
-
-	// MemberDecorateIdEXT only applies to OffsetIdEXT when descriptors are packed in structs.
-	// This is currently unsupported and will fail in compilation.
-	// Pass it through in case someone just needs reflection.
-	case OpMemberDecorateIdEXT:
-		break;
 
 	case OpMemberDecorateStringGOOGLE:
 	{
@@ -721,7 +703,7 @@ void Parser::parse(const Instruction &instruction)
 		}
 		else if (width == 8)
 		{
-			if (length < 2)
+			if (length < 3)
 				SPIRV_CROSS_THROW("Missing encoding for OpTypeFloat 8.");
 			else if (ops[2] == FPEncodingFloat8E4M3EXT)
 				type.basetype = SPIRType::FloatE4M3;
@@ -1151,20 +1133,17 @@ void Parser::parse(const Instruction &instruction)
 		uint32_t type = ops[0];
 
 		auto &ctype = get<SPIRType>(type);
+		uint32_t elements = length - 2;
 
 		// We can have constants which are structs and arrays.
 		// In this case, our SPIRConstant will be a list of other SPIRConstant ids which we
 		// can refer to.
-		if (ctype.basetype == SPIRType::Struct || !ctype.array.empty())
+		if (ctype.basetype == SPIRType::Struct || !ctype.array.empty() || elements > 4)
 		{
 			set<SPIRConstant>(id, type, ops + 2, length - 2, op == OpSpecConstantComposite);
 		}
 		else
 		{
-			uint32_t elements = length - 2;
-			if (elements > 4)
-				SPIRV_CROSS_THROW("OpConstantComposite only supports 1, 2, 3 and 4 elements.");
-
 			SPIRConstant remapped_constant_ops[4];
 			const SPIRConstant *c[4];
 			for (uint32_t i = 0; i < elements; i++)
@@ -1209,6 +1188,15 @@ void Parser::parse(const Instruction &instruction)
 		break;
 	}
 
+	case OpConstantDataKHR:
+	case OpSpecConstantDataKHR:
+	{
+		uint32_t id = ops[1];
+		uint32_t type = ops[0];
+		set<SPIRConstantData>(id, type, ops + 2, length - 2, op == OpSpecConstantDataKHR);
+		break;
+	}
+
 	case OpTypeBufferEXT:
 	{
 		uint32_t type = ops[0];
@@ -1223,13 +1211,13 @@ void Parser::parse(const Instruction &instruction)
 	{
 		uint32_t res = ops[0];
 		uint32_t id = ops[1];
-		// Control
+		uint32_t control = ops[2];
 		uint32_t type = ops[3];
 
 		if (current_function)
 			SPIRV_CROSS_THROW("Must end a function before starting a new one!");
 
-		current_function = &set<SPIRFunction>(id, res, type);
+		current_function = &set<SPIRFunction>(id, res, control, type);
 		break;
 	}
 
@@ -1428,6 +1416,15 @@ void Parser::parse(const Instruction &instruction)
 		ignore_trailing_block_opcodes = true;
 		break;
 
+	case OpAbortKHR:
+		if (!current_block)
+			SPIRV_CROSS_THROW("Trying to end a non-existing block.");
+		current_block->terminator = SPIRBlock::ShaderAbort;
+		current_block->shader_abort.physical_type = ops[0];
+		current_block->shader_abort.payload = ops[1];
+		current_block = nullptr;
+		break;
+
 	case OpReturn:
 	{
 		if (!current_block)
@@ -1588,6 +1585,13 @@ void Parser::parse(const Instruction &instruction)
 
 bool Parser::types_are_logically_equivalent(const SPIRType &a, const SPIRType &b) const
 {
+	unordered_set<uint64_t> visited;
+	return types_are_logically_equivalent(a, b, visited);
+}
+
+bool Parser::types_are_logically_equivalent(const SPIRType &a, const SPIRType &b,
+                                            unordered_set<uint64_t> &visited) const
+{
 	if (a.basetype != b.basetype)
 		return false;
 	if (a.width != b.width)
@@ -1612,10 +1616,16 @@ bool Parser::types_are_logically_equivalent(const SPIRType &a, const SPIRType &b
 	if (a.member_types.size() != b.member_types.size())
 		return false;
 
+	// Buffer references let a struct point back to itself. If we're already
+	// comparing this pair, assume it matches and let the other members decide.
+	if (!visited.insert((uint64_t(a.self) << 32) | uint64_t(b.self)).second)
+		return true;
+
 	size_t member_types = a.member_types.size();
 	for (size_t i = 0; i < member_types; i++)
 	{
-		if (!types_are_logically_equivalent(get<SPIRType>(a.member_types[i]), get<SPIRType>(b.member_types[i])))
+		if (!types_are_logically_equivalent(get<SPIRType>(a.member_types[i]), get<SPIRType>(b.member_types[i]),
+		                                    visited))
 			return false;
 	}
 

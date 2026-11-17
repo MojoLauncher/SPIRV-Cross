@@ -379,12 +379,27 @@ def cross_compile_msl(shader, spirv, opt, iterations, paths):
         msl_args.append('--msl-check-discarded-frag-stores')
     if '.force-frag-with-side-effects-execution.' in shader:
         msl_args.append('--msl-force-frag-with-side-effects-execution')
+    if '.emulate-reversed-depth-viewport.' in shader:
+        msl_args.append('--msl-emulate-reversed-depth-viewport')
+    if '.emulate-depth-clip-enable.' in shader:
+        msl_args.append('--msl-emulate-depth-clip-enable')
+    if '.fixup-clipspace.' in shader:
+        msl_args.append('--fixup-clipspace')
     if '.lod-as-grad.' in shader:
         msl_args.append('--msl-sample-dref-lod-array-as-grad')
     if '.agx-cube-grad.' in shader:
         msl_args.append('--msl-agx-manual-cube-grad-fixup')
     if '.decoration-binding.' in shader:
         msl_args.append('--msl-decoration-binding')
+    if '.resource-binding.' in shader:
+        # Arbitrary for testing purposes.
+        # Set 0, binding 0 gets texture index 0 and sampler index 1, like a combined image sampler in MoltenVK.
+        msl_args.append('--msl-resource-binding')
+        msl_args.append('0')
+        msl_args.append('0')
+        msl_args.append('0')
+        msl_args.append('0')
+        msl_args.append('1')
     if '.rich-descriptor.' in shader:
         msl_args.append('--msl-runtime-array-rich-descriptor')
     if '.replace-recursive-inputs.' in shader:
@@ -483,12 +498,16 @@ def validate_shader_hlsl(shader, force_no_external_validation, paths):
     if test_glslang:
         subprocess.check_call(hlsl_args)
 
+    # FXC cannot compile shaders above shader model 5
+    shader_model = shader_model_hlsl(shader)
+    is_valid_fxc_shader_model = shader_model and len(shader_model) >= 3 and int(shader_model[-3]) <= 5
+
     is_no_fxc = '.nofxc.' in shader
     global ignore_fxc
-    if (not ignore_fxc) and (not force_no_external_validation) and (not is_no_fxc):
+    if (not ignore_fxc) and (not force_no_external_validation) and (not is_no_fxc) and is_valid_fxc_shader_model:
         try:
             win_path = shader_to_win_path(shader)
-            args = ['fxc', '-nologo', shader_model_hlsl(shader), win_path]
+            args = ['fxc', '-nologo', shader_model, win_path]
             if '.nonuniformresource.' in shader:
                 args.append('/enable_unbounded_descriptor_tables')
             subprocess.check_call(args)
@@ -513,6 +532,8 @@ def shader_to_sm(shader):
         return '60'
     elif '.sm68.' in shader:
         return '68'
+    elif '.sm64.' in shader:
+        return '64'
     elif '.sm51.' in shader:
         return '51'
     elif '.sm30.' in shader:
